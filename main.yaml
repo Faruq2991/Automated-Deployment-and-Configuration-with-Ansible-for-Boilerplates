@@ -1,0 +1,217 @@
+---
+- name: Configure server and deploy boilerplate application
+  hosts: all
+  become: yes
+  become_method: sudo
+  vars:
+    repository_url: 'https://github.com/hngprojects/hng_boilerplate_java_web.git'
+    branch: 'devops'
+    deploy_dir: '/opt/stage_5b'
+    pg_admin_user: 'admin'
+    pg_admin_password: 'secure_password'
+    pg_password_file: '/var/secrets/pg_pw.txt'
+    app_port: 3000
+    nginx_port: 80
+    log_dir: '/var/log/stage_5b'
+    log_error: 'error.log'
+    log_out: 'out.log'
+    hng_user: 'hng'
+
+  tasks:
+  - name: Ensure the hng user exists
+    user:
+      name: "{{ hng_user }}"
+      shell: /bin/bash
+      groups: sudo
+      state: present
+      createhome: yes
+
+  - name: Add user to sudoers
+    lineinfile:
+      path: /etc/sudoers
+      state: present
+      regexp: '^{{ hng_user }}'
+      line: '{{ hng_user }} ALL=(ALL) NOPASSWD: ALL'
+      validate: 'visudo -cf %s'
+    become: yes
+
+  - name: Create necessary directories
+    file:
+      path: "{{ item }}"
+      state: directory
+      owner: "{{ hng_user }}"
+      group: "{{ hng_user }}"
+      mode: '0755'
+    loop:
+      - "{{ deploy_dir }}"
+      - "{{ log_dir }}"
+      - /var/secrets
+
+  - name: Configure Git safe directory
+    command: git config --global --add safe.directory '*'
+
+  - name: Clone the repository
+    git:
+      repo: "{{ repository_url }}"
+      dest: "{{ deploy_dir }}"
+      version: "{{ branch }}"
+      force: yes
+
+  - name: Change ownership of the app directory
+    file:
+      path: "{{ deploy_dir }}"
+      owner: "{{ hng_user }}"
+      group: "{{ hng_user }}"
+      recurse: yes
+
+  - name: Install application dependencies
+    apt:
+      name:
+        - python3-pip
+        - python3-venv
+        - build-essential
+        - libpq-dev
+        - rabbitmq-server
+        - redis-server
+        - nginx
+        - postgresql
+        - maven
+        - openjdk-17-jdk
+      state: present
+      update_cache: yes
+   
+  - name: Install psycopg2 library
+    pip:
+      name: psycopg2-binary
+  
+  - name: Locate pg_hba.conf
+    command: |
+      find /etc/postgresql -name pg_hba.conf
+    register: pg_hba_location
+
+  - name: Update PostgreSQL authentication method to md5 for local connections
+    lineinfile:
+      path: "{{ pg_hba_location.stdout }}"
+      regexp: '^host\s+all\s+all\s+127.0.0.1/32\s+'
+      line: 'host    all             all             127.0.0.1/32            md5'
+
+  - name: Update PostgreSQL IPv6 authentication method to md5
+    lineinfile:
+      path: "{{ pg_hba_location.stdout }}"
+      regexp: '^host\s+all\s+all\s+::1/128\s+'
+      line: 'host    all             all             ::1/128                 md5'
+
+  - name: Restart PostgreSQL
+    service:
+      name: postgresql
+      state: restarted
+
+  - name: Set PostgreSQL password for user 'postgres'
+    become: yes
+    become_user: postgres
+    command: psql -c "ALTER USER postgres PASSWORD '{{ pg_admin_password }}';"
+    environment:
+      TMPDIR: "$HOME"
+
+  - name: Configure PostgreSQL database
+    become: yes
+    become_user: postgres
+    postgresql_db:
+      name: mydatabase
+      owner: postgres
+      state: present
+
+  - name: Save PostgreSQL credentials
+    copy:
+      content: "username: {{ pg_admin_user }}\npassword: {{ pg_admin_password }}"
+      dest: "{{ pg_password_file }}"
+      owner: root
+      group: root
+      mode: '0600'
+
+  - name: Create a virtual environment
+    command: python3 -m venv venv
+    args:
+      chdir: "{{ deploy_dir }}"
+    become: yes 
+    become_user: "{{ hng_user }}"
+
+  - name: Build application
+    become: yes
+    become_user: "{{ hng_user }}"
+    command:
+      cmd: mvn clean package
+      chdir: "{{ deploy_dir }}"
+
+  - name: Configure systemd service for the application
+    copy:
+      dest: /etc/systemd/system/stage_5b.service
+      content: |
+        [Unit]
+        Description=Boilerplate Application
+
+        [Service]
+        User={{ hng_user }}
+        WorkingDirectory={{ deploy_dir }}
+        ExecStart={{ deploy_dir }}/venv/bin/python {{ deploy_dir }}/app.py
+        StandardOutput=file:{{ log_dir }}/{{ log_out }}
+        StandardError=file:{{ log_dir }}/{{ log_error }}
+
+        [Install]
+        WantedBy=multi-user.target
+    notify:
+      - Restart application
+
+  - name: Start and enable application service
+    systemd:
+      name: stage_5b
+      state: started
+      enabled: yes
+      daemon_reload: yes
+
+
+  - name: Configure Nginx to reverse proxy
+    copy:
+      dest: /etc/nginx/sites-available/stage_5b
+      content: |
+        server {
+           listen {{ nginx_port }};
+           location / {
+              proxy_pass http://127.0.0.1:{{ app_port }};
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+              }
+          }
+    notify:
+      - Restart nginx
+
+  - name: Enable Nginx site configuration
+    file:
+      src: /etc/nginx/sites-available/stage_5b
+      dest: /etc/nginx/sites-enabled/stage_5b
+      state: link
+    notify:
+      - Restart nginx
+
+  - name: Ensure log files are owned by hng user
+    file:
+      path: "{{ log_dir }}/{{ item }}"
+      state: touch
+      owner: "{{ hng_user }}"
+      group: "{{ hng_user }}"
+    loop:
+      - "{{ log_error }}"
+      - "{{ log_out }}"
+
+  handlers:
+    - name: Restart application
+      systemd:
+        name: stage_5b
+        state: restarted
+
+    - name: Restart nginx
+      systemd:
+        name: nginx
+        state: restarted
